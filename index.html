@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tone Mosaic</title>
+<style>
+:root{--bg:#0a1226;--fg:#eef3ff;--mut:#9fb0d6;--acc:#7cc4ff;--line:rgba(255,255,255,.18);color-scheme:dark}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+button{font:inherit;color:var(--fg);background:rgba(255,255,255,.08);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-height:44px}
+button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+button.on{background:var(--acc);color:#06101f;border-color:var(--acc)}
+#v{position:fixed;inset:0;width:100%;height:100%;object-fit:cover}
+#ring{position:fixed;left:50%;top:50%;width:56px;height:56px;margin:-28px 0 0 -28px;border:3px solid #fff;border-radius:50%;box-shadow:0 0 0 2px rgba(0,0,0,.55)}
+#top{position:fixed;left:0;right:0;top:0;display:flex;gap:10px;align-items:center;padding:calc(10px + env(safe-area-inset-top,0px)) 12px 10px;background:rgba(10,18,38,.8)}
+#sw{width:26px;height:26px;border-radius:6px;border:1px solid var(--line);flex:none}
+#msg{font-size:15px}
+#panel{position:fixed;left:0;right:0;bottom:0;padding:12px 12px calc(12px + env(safe-area-inset-bottom,0px));background:rgba(10,18,38,.88);max-height:55%;overflow:auto}
+.tabs,.row{display:flex;gap:8px}.tabs button,.row button{flex:1}
+#calUI p{margin:10px 0;color:var(--mut);font-size:14px}
+#btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+#btns button{display:flex;align-items:center;gap:8px;text-align:left}
+#btns i{width:18px;height:18px;border-radius:4px;border:1px solid var(--line);flex:none;background:transparent}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:14px;padding:28px;background:var(--bg)}
+#start h1{margin:0;font-size:34px;font-weight:600;letter-spacing:-.01em}
+#start p{margin:0;max-width:34ch;color:var(--mut)}
+#go{background:var(--acc);color:#06101f;border-color:var(--acc);font-weight:600;padding:12px 22px}
+#err{color:#ffb4a8}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<video id="v" playsinline muted autoplay></video>
+<div id="ring" hidden></div>
+<div id="top" hidden><span id="sw"></span><span id="msg">Ready</span></div>
+<div id="panel" hidden>
+  <div class="tabs"><button id="bCal">Calibrate</button><button id="bPlay">Play</button></div>
+  <div id="calUI">
+    <p>Hold the circle on a tile of that tone, then tap its button. Do this under the exhibition lighting.</p>
+    <div id="btns"></div>
+    <div class="row"><button id="bCopy">Copy calibration code</button><button id="bReset">Reset</button></div>
+  </div>
+</div>
+<div id="start">
+  <h1>Tone Mosaic</h1>
+  <p>Point the circle at a tile to hear its sound. Allow camera access when asked.</p>
+  <button id="go">Start</button>
+  <p id="err"></p>
+</div>
+
+<script>
+/* ===== Settings you may edit ===== */
+const CONFIG = {
+  BASE: './',                       // folder holding the MP3s (same folder as this file)
+  TRACKS: ['tone1.mp3','tone2.mp3','tone3.mp3','tone4.mp3','tone5.mp3','tone6.mp3'],
+  FADE: 1.2,                        // crossfade length, seconds
+  HOLD_MS: 450,                     // a tone must hold this long before the audio switches
+  MAX_DISTANCE: 22,                 // larger = more forgiving, smaller = stricter (Lab units)
+  RING_PX: 56,                      // on-screen circle size; samples the middle 60% of it
+  TICK_MS: 70,
+  PRESET: null                      // paste a calibration code here to ship one shared calibration
+};
+/* ================================== */
+
+const REFS = [1,2,3,4,5,6].map(n => ({id:'t'+n, label:'Tone '+n, track:n-1}))
+  .concat([{id:'t7',label:'Tone 7 (silent)',track:null},
+           {id:'t8',label:'Tone 8 (silent)',track:null},
+           {id:'seam',label:'Seam or wall (silent)',track:null}]);
+
+const $ = id => document.getElementById(id);
+const video = $('v'), msg = $('msg'), sw = $('sw');
+let cal = {}, mode = 'cal', ctx, tracks = [], activeRef = null, cand = 'none', since = 0, last = [];
+
+try { cal = JSON.parse(localStorage.getItem('mosaicCal') || 'null') || CONFIG.PRESET || {}; }
+catch (e) { cal = CONFIG.PRESET || {}; }
+const save = () => { try { localStorage.setItem('mosaicCal', JSON.stringify(cal)); } catch (e) {} };
+
+function toLab(r, g, b) {
+  const f = c => { c /= 255; return c <= .04045 ? c / 12.92 : Math.pow((c + .055) / 1.055, 2.4); };
+  const R = f(r), G = f(g), B = f(b);
+  const x = (.4124*R + .3576*G + .1805*B) / .95047, y = .2126*R + .7152*G + .0722*B, z = (.0193*R + .1192*G + .9505*B) / 1.08883;
+  const t = v => v > .008856 ? Math.cbrt(v) : 7.787*v + 16/116;
+  const fx = t(x), fy = t(y), fz = t(z);
+  return [116*fy - 16, 500*(fx - fy), 200*(fy - fz)];
+}
+const dist = (p, q) => Math.hypot(p[0]-q[0], p[1]-q[1], p[2]-q[2]);
+
+const cv = document.createElement('canvas'); cv.width = cv.height = 12;
+const cx = cv.getContext('2d', {willReadFrequently: true});
+function read() {
+  if (!video.videoWidth) return null;
+  const scale = Math.max(innerWidth / video.videoWidth, innerHeight / video.videoHeight);
+  const side = Math.max(4, .6 * CONFIG.RING_PX / scale);
+  cx.drawImage(video, (video.videoWidth - side)/2, (video.videoHeight - side)/2, side, side, 0, 0, 12, 12);
+  const d = cx.getImageData(0, 0, 12, 12).data; let r = 0, g = 0, b = 0; const n = d.length / 4;
+  for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i+1]; b += d[i+2]; }
+  r /= n; g /= n; b /= n;
+  return {rgb: [r, g, b], lab: toLab(r, g, b)};
+}
+
+/* ---- audio ---- */
+function initAudio() {
+  ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.resume();
+  tracks = CONFIG.TRACKS.map(f => {
+    const el = new Audio(CONFIG.BASE + f); el.loop = true; el.preload = 'auto'; el.setAttribute('playsinline', '');
+    el.addEventListener('error', () => say('Cannot load ' + f + '. Check the file name and folder.'));
+    const g = ctx.createGain(); g.gain.value = 0;
+    ctx.createMediaElementSource(el).connect(g); g.connect(ctx.destination);
+    el.play().then(() => el.pause()).catch(() => {});
+    return {el, g, on: false, to: 0};
+  });
+}
+function setTrack(i, on) {
+  const t = tracks[i]; if (t.on === on) return; t.on = on;
+  const now = ctx.currentTime, p = t.g.gain;
+  p.cancelScheduledValues(now); p.setValueAtTime(p.value, now);
+  clearTimeout(t.to);
+  if (on) { t.el.play().catch(() => {}); p.linearRampToValueAtTime(1, now + CONFIG.FADE); }
+  else { p.linearRampToValueAtTime(0, now + CONFIG.FADE); t.to = setTimeout(() => { if (!t.on) t.el.pause(); }, CONFIG.FADE * 1000 + 100); }
+}
+function setActive(ref) { activeRef = ref; tracks.forEach((t, i) => setTrack(i, !!ref && ref.track === i)); }
+
+/* ---- main loop ---- */
+function say(s) { msg.textContent = s; }
+function tick() {
+  const s = read(); if (!s) return;
+  last.push(s); if (last.length > 8) last.shift();
+  sw.style.background = 'rgb(' + s.rgb.map(Math.round).join(',') + ')';
+  if (mode === 'cal') { say('Reading the tile under the circle'); return; }
+  let best = null, bd = 1e9;
+  for (const r of REFS) { const c = cal[r.id]; if (!c) continue; const d = dist(s.lab, c.lab); if (d < bd) { bd = d; best = r; } }
+  const det = best && bd <= CONFIG.MAX_DISTANCE ? best : null;
+  const key = det ? det.id : 'none';
+  const now = performance.now();
+  if (key !== cand) { cand = key; since = now; }
+  if (now - since >= CONFIG.HOLD_MS && key !== (activeRef ? activeRef.id : 'none')) setActive(det && det.track !== null ? det : null);
+  say(det ? det.label : 'No tile recognised');
+}
+
+/* ---- calibration UI ---- */
+function renderButtons() {
+  $('btns').innerHTML = '';
+  REFS.forEach(r => {
+    const b = document.createElement('button'), c = cal[r.id];
+    b.innerHTML = '<i style="background:' + (c ? 'rgb(' + c.rgb.map(Math.round).join(',') + ')' : 'transparent') + '"></i><span>' + r.label + (c ? ' ✓' : '') + '</span>';
+    b.onclick = () => {
+      if (last.length < 3) return;
+      const m = k => last.reduce((a, l) => a + l.lab[k], 0) / last.length;
+      const n = k => last.reduce((a, l) => a + l.rgb[k], 0) / last.length;
+      cal[r.id] = {lab: [m(0), m(1), m(2)], rgb: [n(0), n(1), n(2)]};
+      save(); renderButtons();
+    };
+    $('btns').appendChild(b);
+  });
+}
+function setMode(m) {
+  if (m === 'play') {
+    const missing = REFS.filter(r => r.track !== null && !cal[r.id]);
+    if (missing.length) { say('Calibrate ' + missing.map(r => r.label).join(', ') + ' first'); return; }
+  }
+  mode = m; setActive(null); cand = 'none';
+  $('bCal').classList.toggle('on', m === 'cal'); $('bPlay').classList.toggle('on', m === 'play');
+  $('calUI').hidden = m !== 'cal';
+}
+$('bCal').onclick = () => setMode('cal');
+$('bPlay').onclick = () => setMode('play');
+$('bReset').onclick = () => { cal = {}; try { localStorage.removeItem('mosaicCal'); } catch (e) {} renderButtons(); setMode('cal'); };
+$('bCopy').onclick = () => {
+  const code = JSON.stringify(cal);
+  if (navigator.clipboard) navigator.clipboard.writeText(code).then(() => say('Calibration code copied')).catch(() => prompt('Copy this code', code));
+  else prompt('Copy this code', code);
+};
+
+/* ---- start ---- */
+$('go').onclick = async () => {
+  $('err').textContent = '';
+  try {
+    initAudio();
+    const stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: {ideal: 'environment'}}, audio: false});
+    video.srcObject = stream; await video.play();
+  } catch (e) {
+    $('err').textContent = 'Camera unavailable. Allow camera access in the browser settings and reload. This page needs https.';
+    return;
+  }
+  $('start').hidden = true; ['ring', 'top', 'panel'].forEach(id => $(id).hidden = false);
+  renderButtons(); setMode('cal');
+  setInterval(tick, CONFIG.TICK_MS);
+};
+</script>
+</body>
+</html>
