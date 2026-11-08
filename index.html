@@ -36,6 +36,8 @@ button.on{background:var(--acc);color:#06101f;border-color:var(--acc)}
 <div id="top" hidden><span id="sw"></span><span id="msg">Ready</span></div>
 <div id="panel" hidden>
   <div class="tabs"><button id="bCal">Calibrate</button><button id="bPlay">Play</button></div>
+  <p style="margin:10px 0 6px;color:var(--mut);font-size:14px">Test each track directly (use Calibrate mode):</p>
+  <div class="row" id="tst" style="margin-bottom:6px"></div>
   <div id="calUI">
     <p>Hold the circle on a tile of that tone, then tap its button. Do this under the exhibition lighting.</p>
     <div id="btns"></div>
@@ -53,7 +55,8 @@ button.on{background:var(--acc);color:#06101f;border-color:var(--acc)}
 /* ===== Settings you may edit ===== */
 const CONFIG = {
   BASE: './',                       // folder holding the MP3s (same folder as this file)
-  TRACKS: ['tone1.mp3','tone2.mp3','tone3.mp3','tone4.mp3','tone5.mp3','tone6.mp3'],
+  TRACKS: ['tone1','tone2','tone3','tone4','tone5','tone6'],   // file names without extension
+  EXTS: ['m4a','mp3','aac','ogg','opus','wav'],                // the page finds which one exists
   FADE: 1.2,                        // crossfade length, seconds
   HOLD_MS: 450,                     // a tone must hold this long before the audio switches
   MAX_DISTANCE: 22,                 // larger = more forgiving, smaller = stricter (Lab units)
@@ -102,27 +105,31 @@ function read() {
 /* ---- audio ---- */
 function initAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.resume();
-  tracks = CONFIG.TRACKS.map(f => {
-    const el = new Audio(CONFIG.BASE + f); el.loop = true; el.preload = 'auto'; el.setAttribute('playsinline', '');
-    el.addEventListener('error', () => say('Cannot load ' + f + '. Check the file name and folder.'));
-    const g = ctx.createGain(); g.gain.value = 0;
-    ctx.createMediaElementSource(el).connect(g); g.connect(ctx.destination);
-    el.play().then(() => el.pause()).catch(() => {});
-    return {el, g, on: false, to: 0};
+  tracks = CONFIG.TRACKS.map((name, i) => {
+    const t = {on: false, to: 0, url: urls[i]};
+    const el = t.el = new Audio(); el.loop = true; el.preload = 'auto'; el.setAttribute('playsinline', '');
+    el.addEventListener('error', () => { sticky = 'Cannot play ' + (t.url || name) + '. This browser may not support the format.'; });
+    t.g = ctx.createGain(); t.g.gain.value = 0;
+    ctx.createMediaElementSource(el).connect(t.g); t.g.connect(ctx.destination);
+    if (t.url) { el.src = t.url; el.play().then(() => { if (!t.on) el.pause(); }).catch(() => {}); }
+    return t;
   });
+  const miss = CONFIG.TRACKS.filter((n, i) => !urls[i]);
+  if (miss.length) sticky = 'Audio files not found: ' + miss.join(', ');
 }
 function setTrack(i, on) {
-  const t = tracks[i]; if (t.on === on) return; t.on = on;
+  const t = tracks[i]; if (!t.url || t.on === on) return; t.on = on;
   const now = ctx.currentTime, p = t.g.gain;
   p.cancelScheduledValues(now); p.setValueAtTime(p.value, now);
   clearTimeout(t.to);
-  if (on) { t.el.play().catch(() => {}); p.linearRampToValueAtTime(1, now + CONFIG.FADE); }
+  if (on) { ctx.resume(); t.el.play().catch(e => { sticky = 'Audio blocked: ' + e.name; }); p.linearRampToValueAtTime(1, now + CONFIG.FADE); }
   else { p.linearRampToValueAtTime(0, now + CONFIG.FADE); t.to = setTimeout(() => { if (!t.on) t.el.pause(); }, CONFIG.FADE * 1000 + 100); }
 }
 function setActive(ref) { activeRef = ref; tracks.forEach((t, i) => setTrack(i, !!ref && ref.track === i)); }
 
 /* ---- main loop ---- */
-function say(s) { msg.textContent = s; }
+let sticky = '';
+function say(s) { msg.textContent = sticky || s; }
 function tick() {
   const s = read(); if (!s) return;
   last.push(s); if (last.length > 8) last.shift();
@@ -172,6 +179,30 @@ $('bCopy').onclick = () => {
   else prompt('Copy this code', code);
 };
 
+/* ---- find audio files, test buttons ---- */
+const urls = [];
+async function probe() {
+  await Promise.all(CONFIG.TRACKS.map(async (name, i) => {
+    const n = i + 1;
+    const bases = [name, 'tone ' + n, 'Tone ' + n, 'Tone' + n, 'tone_' + n, 'tone-' + n];
+    for (const b of bases) for (const x of CONFIG.EXTS) {
+      const u = CONFIG.BASE + encodeURIComponent(b) + '.' + x;
+      try { const r = await fetch(u, {method: 'HEAD'}); if (r.ok) { urls[i] = u; return; } } catch (e) {}
+    }
+  }));
+  const bad = CONFIG.TRACKS.filter((n, i) => !urls[i]);
+  $('err').textContent = bad.length ? 'Audio files not found: ' + bad.join(', ') + '. Check the names in the repo.' : '';
+}
+probe();
+function renderTests() {
+  $('tst').innerHTML = '';
+  tracks.forEach((t, i) => {
+    const b = document.createElement('button'); b.textContent = '▶ ' + (i + 1);
+    b.onclick = () => { setTrack(i, !t.on); b.classList.toggle('on', t.on); };
+    $('tst').appendChild(b);
+  });
+}
+
 /* ---- start ---- */
 $('go').onclick = async () => {
   $('err').textContent = '';
@@ -184,7 +215,7 @@ $('go').onclick = async () => {
     return;
   }
   $('start').hidden = true; ['ring', 'top', 'panel'].forEach(id => $(id).hidden = false);
-  renderButtons(); setMode('cal');
+  renderButtons(); renderTests(); setMode('cal');
   setInterval(tick, CONFIG.TICK_MS);
 };
 </script>
